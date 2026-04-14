@@ -2,18 +2,19 @@ import streamlit as st
 import pandas as pd
 import google.generativeai as genai
 import re
-import time
 import json
 
+# --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="BRT Validator AI", page_icon="🚚", layout="wide")
 st.title("🚚 AI Logistics Validator (BRT/nShift)")
-st.markdown("Wgraj plik CSV z Lookera. AI przeanalizuje logistykę, a Python automatycznie naprawi ucięte zera i włoskie akcenty.")
+st.markdown("Wgraj plik CSV z Lookera. System automatycznie naprawi ucięte zera i akcenty, a AI zweryfikuje miasta w **jednym błyskawicznym zapytaniu**.")
 
-# Pobieranie bezpiecznego klucza z ustawień chmury
+# --- BEZPIECZNY KLUCZ API ---
 API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
+# --- GŁÓWNY INTERFEJS ---
 uploaded_file = st.file_uploader("Wgraj plik CSV z Lookera", type=["csv"])
 
 if uploaded_file:
@@ -21,79 +22,87 @@ if uploaded_file:
     st.subheader("Oryginalne dane (Podgląd):")
     st.dataframe(df.head())
 
-    if st.button("🚀 Uruchom Analizę AI", type="primary"):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results_status = []
-        results_fixes = []
-        total_rows = len(df)
-        
-        for index, row in df.iterrows():
-            progress_bar.progress((index + 1) / total_rows)
-            status_text.text(f"Analizowanie wiersza {index + 1} z {total_rows}...")
+    if st.button("🚀 Uruchom Analizę AI (Tryb Błyskawiczny)", type="primary"):
+        with st.spinner("Pakuję dane i wysyłam jedno główne zapytanie do AI. To potrwa ok. 10 sekund..."):
             
-            street = str(row.get('Address 1', row.get('Address', '')))
-            city = str(row.get('City', row.get('Delivery Area', '')))
-            zip_code = str(row.get('Postcode', '')).strip()
+            results_status = []
+            results_fixes = []
+            addresses_to_check = []
             
-            issues = []
-            
-            if len(zip_code) < 5 and zip_code != 'nan':
-                zip_code = zip_code.zfill(5)
-                issues.append(f"Zaktualizowano CAP na {zip_code}")
+            # --- FAZA 1: Czyszczenie lokalne w ułamek sekundy ---
+            for index, row in df.iterrows():
+                street = str(row.get('Address 1', row.get('Address', '')))
+                city = str(row.get('City', row.get('Delivery Area', '')))
+                zip_code = str(row.get('Postcode', '')).strip()
                 
-            if re.search(r'[éàòìùÉÀÒÌÙ]', street):
-                street = re.sub(r'[éÉ]', 'e', street)
-                street = re.sub(r'[àÀ]', 'a', street)
-                street = re.sub(r'[òÒ]', 'o', street)
-                street = re.sub(r'[ìÌ]', 'i', street)
-                street = re.sub(r'[ùÙ]', 'u', street)
-                issues.append("Usunięto akcenty z adresu")
+                issues = []
+                
+                if len(zip_code) < 5 and zip_code != 'nan':
+                    zip_code = zip_code.zfill(5)
+                    issues.append(f"Zaktualizowano CAP na {zip_code}")
+                    
+                if re.search(r'[éàòìùÉÀÒÌÙ]', street):
+                    issues.append("Znaleziono i usunięto akcenty z adresu")
 
+                results_fixes.append(" | ".join(issues))
+                results_status.append("❌ Wymaga poprawy" if issues else "✅ OK")
+                
+                # Dodajemy adres do głównej paczki dla AI
+                addresses_to_check.append({
+                    "id": index,
+                    "city": city,
+                    "zip": zip_code
+                })
+
+            # --- FAZA 2: JEDNO POTĘŻNE ZAPYTANIE DO AI (Omija limity) ---
             prompt = f"""
-            Analyze this Italian address for shipping:
-            City: {city}
-            ZIP Code: {zip_code}
+            You are an Italian logistics expert. Verify this list of shipping addresses.
+            1. Check if ZIP matches the City.
+            2. Check if City is a Frazione. If yes, return the main municipality.
             
-            Task:
-            1. Check if the ZIP matches the City.
-            2. Check if the City is a "Frazione". If yes, find the main municipality.
+            Data:
+            {json.dumps(addresses_to_check)}
             
-            Respond ONLY in valid JSON format:
-            {{"status": "OK" or "ERROR", "message": "Short explanation or empty if OK"}}
+            Return ONLY a JSON array with this exact structure (no extra text, no markdown):
+            [
+                {{"id": 0, "status": "OK" or "ERROR", "message": "Details to fix or empty if OK"}}
+            ]
             """
             
             try:
+                # Wysyłamy jedną listę zamiast 60 oddzielnych zapytań
                 response = model.generate_content(prompt)
                 ai_text = response.text.replace('```json', '').replace('```', '').strip()
-                ai_data = json.loads(ai_text)
-                if ai_data.get("status") == "ERROR":
-                    issues.append(ai_data.get("message"))
-            except Exception as e:
-                issues.append(f"Błąd API: {str(e)}")
-                time.sleep(2) 
-            
-            if len(issues) == 0:
-                results_status.append("✅ OK")
-                results_fixes.append("")
-            else:
-                results_status.append("❌ Wymaga poprawy")
-                results_fixes.append(" | ".join(issues))
+                ai_results = json.loads(ai_text)
                 
-            time.sleep(0.5)
+                # --- FAZA 3: Połączenie wyników ---
+                for item in ai_results:
+                    idx = item["id"]
+                    if item.get("status") == "ERROR":
+                        if results_status[idx] == "✅ OK":
+                            results_status[idx] = "❌ Wymaga poprawy"
+                            results_fixes[idx] = item.get("message", "Błąd dopasowania")
+                        else:
+                            results_fixes[idx] += " | AI: " + item.get("message", "")
+                            
+            except Exception as e:
+                st.error(f"Błąd przetwarzania AI: {str(e)}")
+                st.warning("Google API odrzuciło zapytanie. Wyświetlam na razie tylko naprawione zera i akcenty.")
+
+            # Zapisujemy gotowe wyniki do tabeli
+            df['AI Status'] = results_status
+            df['Rekomendacje'] = results_fixes
             
-        df['AI Status'] = results_status
-        df['Rekomendacje'] = results_fixes
-        
-        status_text.text("✅ Analiza zakończona sukcesem!")
-        st.subheader("Wyniki Analizy:")
-        df_errors = df[df['AI Status'] != "✅ OK"]
-        st.dataframe(df_errors if not df_errors.empty else df)
-        
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Pobierz zwalidowany plik CSV",
-            data=csv,
-            file_name='Validated_BRT_Deliveries.csv',
-            mime='text/csv',
-        )
+            st.success("✅ Analiza zakończona sukcesem!")
+            
+            st.subheader("Wyniki Analizy:")
+            df_errors = df[df['AI Status'] != "✅ OK"]
+            st.dataframe(df_errors if not df_errors.empty else df)
+            
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Pobierz zwalidowany plik CSV",
+                data=csv,
+                file_name='Validated_BRT_Deliveries.csv',
+                mime='text/csv',
+            )
