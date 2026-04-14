@@ -5,33 +5,27 @@ import re
 import time
 import json
 
-# --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="BRT Validator AI", page_icon="🚚", layout="wide")
 st.title("🚚 AI Logistics Validator (BRT/nShift)")
-st.markdown("Wgraj plik CSV z Lookera. AI przeanalizuje miasta i kody pocztowe, a system automatycznie naprawi ucięte zera i włoskie akcenty.")
+st.markdown("Wgraj plik CSV z Lookera. AI przeanalizuje logistykę, a Python automatycznie naprawi ucięte zera i włoskie akcenty.")
 
-# --- STAŁY KLUCZ API ---
-API_KEY = "AIzaSyCad9SeljWKjwb7S5Pp4RbtTB4FhrakxK4"
+# Pobieranie bezpiecznego klucza z ustawień chmury
+API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- GŁÓWNY INTERFEJS ---
 uploaded_file = st.file_uploader("Wgraj plik CSV z Lookera", type=["csv"])
 
 if uploaded_file:
-    # Wczytanie pliku - wymuszamy, aby kod pocztowy był traktowany jako tekst!
     df = pd.read_csv(uploaded_file, dtype={'Postcode': str})
-    
     st.subheader("Oryginalne dane (Podgląd):")
     st.dataframe(df.head())
 
     if st.button("🚀 Uruchom Analizę AI", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
         results_status = []
         results_fixes = []
-        
         total_rows = len(df)
         
         for index, row in df.iterrows():
@@ -42,7 +36,6 @@ if uploaded_file:
             city = str(row.get('City', row.get('Delivery Area', '')))
             zip_code = str(row.get('Postcode', '')).strip()
             
-            # --- FAZA 1: Szybkie czyszczenie w Pythonie ---
             issues = []
             
             if len(zip_code) < 5 and zip_code != 'nan':
@@ -57,7 +50,6 @@ if uploaded_file:
                 street = re.sub(r'[ùÙ]', 'u', street)
                 issues.append("Usunięto akcenty z adresu")
 
-            # --- FAZA 2: Analiza AI (Tylko logistyka) ---
             prompt = f"""
             Analyze this Italian address for shipping:
             City: {city}
@@ -75,10 +67,8 @@ if uploaded_file:
                 response = model.generate_content(prompt)
                 ai_text = response.text.replace('```json', '').replace('```', '').strip()
                 ai_data = json.loads(ai_text)
-                
                 if ai_data.get("status") == "ERROR":
                     issues.append(ai_data.get("message"))
-                    
             except Exception as e:
                 issues.append(f"Błąd API: Odczekaj chwilę")
                 time.sleep(2) 
@@ -90,13 +80,12 @@ if uploaded_file:
                 results_status.append("❌ Wymaga poprawy")
                 results_fixes.append(" | ".join(issues))
                 
-            time.sleep(0.5) # Bezpieczny odstęp
+            time.sleep(0.5)
             
         df['AI Status'] = results_status
         df['Rekomendacje'] = results_fixes
         
         status_text.text("✅ Analiza zakończona sukcesem!")
-        
         st.subheader("Wyniki Analizy:")
         df_errors = df[df['AI Status'] != "✅ OK"]
         st.dataframe(df_errors if not df_errors.empty else df)
