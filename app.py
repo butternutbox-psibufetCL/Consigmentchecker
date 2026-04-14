@@ -70,7 +70,7 @@ if uploaded_file:
                 if ai_data.get("status") == "ERROR":
                     issues.append(ai_data.get("message"))
             except Exception as e:
-                issues.append(f"Błąd API: Odczekaj chwilę")
+                issues.append(f"Błąd API: {str(e)}")
                 time.sleep(2) 
             
             if len(issues) == 0:
