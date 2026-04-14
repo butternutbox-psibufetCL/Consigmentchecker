@@ -38,6 +38,15 @@ if uploaded_file:
         for index, row in df.iterrows():
             street = str(row.get('Address 1', row.get('Address', '')))
             city = str(row.get('City', row.get('Delivery Area', ''))).strip()
+            
+            # --- NEW SMART CLEANING FOR CITIES ---
+            # 1. Remove province abbreviations like "(RM)" or "(SV)"
+            city = re.sub(r'\s*\([A-Za-z]{2}\)', '', city)
+            
+            # 2. Split by slash '/' and keep only the first part ("Merano /Sinigo" -> "Merano")
+            city = city.split('/')[0].strip()
+            # -------------------------------------
+            
             zip_code = str(row.get('Postcode', '')).strip()
             
             issues = []
