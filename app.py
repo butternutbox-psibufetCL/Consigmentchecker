@@ -10,7 +10,7 @@ import time
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Butternut Box | BRT System", page_icon="🚚", layout="wide")
 st.title("🚚 Hybrydowy System Logistyczny BRT")
-st.markdown("Walidacja ISTAT + AI + Automatyczny Radar Opóźnień.")
+st.markdown("Walidacja ISTAT + AI + Automatyczny Radar Opóźnień (Odporny na format plików z Lookera).")
 
 # --- KONFIGURACJA AI (PASEK BOCZNY) ---
 st.sidebar.header("⚙️ Ustawienia AI")
@@ -63,7 +63,7 @@ def validate_address(street, city, zip_code, df_cap):
         issues.append("Naprawiono akcenty/apostrofy")
 
     clean_city = re.sub(r'\s*\([A-Za-z]{2}\)', '', city)
-    clean_city = re.sub(r'\s+[A-Za-z]{2}$', '', clean_city).strip() # Fix na prowincje bez nawiasów np. PV
+    clean_city = re.sub(r'\s+[A-Za-z]{2}$', '', clean_city).strip() 
     clean_city = clean_city.split('/')[0].strip()
 
     if 'cap' in df_cap.columns and 'denominazione_ita' in df_cap.columns:
@@ -97,6 +97,25 @@ def check_brt_status(url):
         else: return "⚠️ Wymaga sprawdzenia ręcznego"
     except:
         return "❌ Błąd połączenia ze stroną"
+
+# --- SMART DETEKTOR KOLUMN ---
+def load_robust_csv(uploaded_file, required_columns):
+    uploaded_file.seek(0)
+    df_temp = pd.read_csv(uploaded_file, header=None) # Wczytujemy wszystko jak leci
+    
+    # Przeszukujemy pierwsze 20 wierszy w poszukiwaniu naszych kolumn
+    header_idx = None
+    for idx, row in df_temp.head(20).iterrows():
+        row_str = " ".join([str(val) for val in row.values])
+        if all(req in row_str for req in required_columns):
+            header_idx = idx
+            break
+            
+    if header_idx is not None:
+        uploaded_file.seek(0)
+        # Ładujemy plik, ucinając wszystkie śmieci powyżej znalezionego nagłówka
+        return pd.read_csv(uploaded_file, header=header_idx)
+    return None
 
 # --- ZAKŁADKI ---
 tab1, tab2, tab3 = st.tabs(["📁 Masowe sprawdzanie", "🔍 AI Support", "📡 Radar Opóźnień BRT"])
@@ -140,38 +159,37 @@ with tab2:
                 if api_key:
                     if st.button("🛠️ AI: Napraw Adres"):
                         with st.spinner("AI analizuje..."):
-                            response = model.generate_content(f'Zrekonstruuj błędny adres dla kuriera nShift. Oddziel Ulicę, Miasto i Kod. Adres: "{man_street} {man_city} {man_zip}". Zwróć tylko czysty JSON: {{"Ulica": "", "Miasto": "", "Kod": ""}}')
+                            response = model.generate_content(f'Zrekonstruuj błędny adres. Oddziel Ulicę, Miasto i Kod. Adres: "{man_street} {man_city} {man_zip}". Zwróć JSON: {{"Ulica": "", "Miasto": "", "Kod": ""}}')
                             st.code(response.text.replace('```json', '').replace('```', '').strip(), language='json')
         else:
             st.error("⚠️ Podaj miasto i kod.")
 
 # --- ZAKŁADKA 3: RADAR OPÓŹNIEŃ BRT ---
 with tab3:
-    st.markdown("### 📡 Radar Opóźnień (Skaner Trackingu)")
-    st.markdown("Wgraj raport `Details.csv`, a system sam sprawdzi włoskie statusy na stronie BRT i wyciągnie paczki wymagające interwencji (Ad-hoc box).")
+    st.markdown("### 📡 Radar Opóźnień (Odporny na formatowanie)")
+    st.markdown("Wgraj raport CSV. System sam znajdzie odpowiednie kolumny, niezależnie od śmieci w pliku.")
     
-    details_file = st.file_uploader("Wgraj plik 'Details.csv'", type=["csv"], key="details_upload")
+    details_file = st.file_uploader("Wgraj plik raportu BRT/Looker", type=["csv"], key="details_upload")
     
     if details_file:
-        # Próba wczytania pliku (często raporty mają przesunięty nagłówek)
-        df_details = pd.read_csv(details_file)
-        if 'Tracking URL' not in df_details.columns:
-            details_file.seek(0)
-            df_details = pd.read_csv(details_file, header=1) # Jeżeli Looker dodaje puste wiersze u góry
+        # Używamy naszego nowego, inteligentnego detektora!
+        df_details = load_robust_csv(details_file, ['Tracking URL', 'Soc Link'])
             
-        if 'Tracking URL' in df_details.columns and 'Soc Link' in df_details.columns:
-            # Odrzucamy te z jawnym statusem delivered w nShift
-            if 'Consignment Status' in df_details.columns:
-                df_pending = df_details[df_details['Consignment Status'] != 'delivered'].copy()
+        if df_details is not None:
+            # Szukamy kolumny ze statusem (żeby ominąć już dostarczone)
+            status_col = [col for col in df_details.columns if 'status' in col.lower()]
+            if status_col:
+                df_pending = df_details[df_details[status_col[0]].astype(str).str.lower() != 'delivered'].copy()
             else:
                 df_pending = df_details.copy()
                 
-            # Filtrujemy tylko te, które mają fizycznie wygenerowany link
+            # Filtrujemy tylko te, które faktycznie mają link BRT
             df_pending = df_pending.dropna(subset=['Tracking URL'])
+            df_pending = df_pending[df_pending['Tracking URL'].astype(str).str.contains('http')]
             
-            st.info(f"🔎 Znaleziono {len(df_pending)} paczek wymagających weryfikacji. Rozpoczynam skanowanie BRT...")
+            st.info(f"🔎 Oczyszczono plik! Znaleziono nagłówki i wyizolowano {len(df_pending)} paczek wymagających sprawdzenia.")
             
-            if st.button("🚀 Uruchom skanowanie linków BRT", type="primary"):
+            if st.button("🚀 Skanuj statusy BRT", type="primary"):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
@@ -180,36 +198,25 @@ with tab3:
                 
                 for i, row in enumerate(df_pending.iterrows()):
                     url = str(row[1]['Tracking URL'])
-                    if "http" in url:
-                        # Pobieramy prawdziwy status ze strony BRT
-                        brt_status = check_brt_status(url)
-                    else:
-                        brt_status = "Brak prawidłowego linku"
-                        
+                    brt_status = check_brt_status(url)
                     real_statuses.append(brt_status)
                     
-                    # Aktualizacja paska postępu
                     progress_bar.progress((i + 1) / total)
-                    status_text.text(f"Skanowanie: {i + 1} z {total} paczek...")
-                    time.sleep(0.5) # Krótka pauza, by BRT nie zablokowało bota
+                    status_text.text(f"Sprawdzam: {i + 1} / {total}")
+                    time.sleep(0.5) 
                 
                 df_pending['Prawdziwy Status BRT'] = real_statuses
-                
-                # Zostawiamy tylko problemy (odrzucamy te, które na stronie okazały się już dostarczone)
                 df_critical = df_pending[~df_pending['Prawdziwy Status BRT'].str.contains("Dostarczona", na=False)]
                 
                 st.success("✅ Skanowanie zakończone!")
-                st.markdown("### 🚨 Akcje Krytyczne (Zamówienia wymagające interwencji):")
+                st.markdown("### 🚨 Wymagane Akcje (Opóźnienia i Zwroty):")
                 
-                # Przygotowujemy ładną tabelę dla Supportu
                 df_display = df_critical[['Prawdziwy Status BRT', 'Tracking URL', 'Soc Link']]
-                
-                # Używamy st.data_editor z formatowaniem linków, żeby można było w nie klikać
                 st.data_editor(
                     df_display,
                     column_config={
                         "Tracking URL": st.column_config.LinkColumn("Link BRT"),
-                        "Soc Link": st.column_config.LinkColumn("Profil Klienta (CRM)")
+                        "Soc Link": st.column_config.LinkColumn("Profil CRM")
                     },
                     hide_index=True,
                     use_container_width=True
@@ -222,4 +229,4 @@ with tab3:
                     mime='text/csv'
                 )
         else:
-            st.error("Błąd: Plik nie zawiera wymaganych kolumn ('Tracking URL', 'Soc Link'). Upewnij się, że wgrywasz poprawny raport Details.csv.")
+            st.error("❌ Błąd: Nie znalazłem w tym pliku kolumn 'Tracking URL' ani 'Soc Link'. Upewnij się, że pobierasz odpowiedni raport z Lookera.")
