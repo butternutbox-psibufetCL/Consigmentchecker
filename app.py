@@ -2,13 +2,29 @@ import streamlit as st
 import pandas as pd
 import re
 import difflib
+import google.generativeai as genai
+import requests
+from bs4 import BeautifulSoup
+import time
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="BRT Validator Offline", page_icon="🚚", layout="wide")
-st.title("🚚 BRT Logistics Validation System")
-st.markdown("100% reliable version. Runs on the local ISTAT database. Processes data in a fraction of a second.")
+# --- KONFIGURACJA STRONY ---
+st.set_page_config(page_title="Butternut Box | BRT System", page_icon="🚚", layout="wide")
+st.title("🚚 Hybrydowy System Logistyczny BRT")
+st.markdown("Walidacja ISTAT + AI + Automatyczny Radar Opóźnień.")
 
-# --- LOAD LOCAL CAP DATABASE ---
+# --- KONFIGURACJA AI (PASEK BOCZNY) ---
+st.sidebar.header("⚙️ Ustawienia AI")
+api_key = st.sidebar.text_input("Wklej klucz Gemini API:", type="password")
+
+if api_key:
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        st.sidebar.success("AI połączone! Funkcje odblokowane.")
+    except Exception as e:
+        st.sidebar.error("Błąd połączenia z API.")
+
+# --- BAZA LOKALNA ---
 @st.cache_data
 def load_cap_database():
     try:
@@ -19,13 +35,11 @@ def load_cap_database():
         return None
 
 df_cap = load_cap_database()
-
 if df_cap is None:
-    st.error("❌ The 'gi_comuni_cap.csv' file is missing. Please add this file to your GitHub repository.")
+    st.error("❌ Brakuje pliku 'gi_comuni_cap.csv'.")
     st.stop()
 
-# --- MAIN VALIDATION ENGINE (DRY) ---
-# This single function acts as the "brain" for both CSV uploads and manual checks
+# --- GŁÓWNY SILNIK WALIDUJĄCY (OFFLINE) ---
 def validate_address(street, city, zip_code, df_cap):
     issues = []
     status = "✅ OK"
@@ -34,113 +48,178 @@ def validate_address(street, city, zip_code, df_cap):
     city = str(city).strip()
     zip_code = str(zip_code).strip()
 
-    # 1. FIX LEADING ZEROS IN ZIP CODE
     if len(zip_code) < 5 and zip_code != 'nan' and zip_code != '':
         zip_code = zip_code.zfill(5)
-        issues.append(f"Added zeros: {zip_code}")
+        issues.append(f"Dodano zera: {zip_code}")
 
-    # 2. CLEAN DIACRITIC CHARACTERS (ACCENTS)
-    if re.search(r'[éàòìùÉÀÒÌÙ]', street):
+    if re.search(r"[éàòìùÉÀÒÌÙ’‘`]", street) or re.search(r"[’‘`]", city):
         street = re.sub(r'[éÉ]', 'e', street)
         street = re.sub(r'[àÀ]', 'a', street)
         street = re.sub(r'[òÒ]', 'o', street)
         street = re.sub(r'[ìÌ]', 'i', street)
         street = re.sub(r'[ùÙ]', 'u', street)
-        issues.append("Removed accents")
+        street = re.sub(r"[’‘`]", "'", street)
+        city = re.sub(r"[’‘`]", "'", city)
+        issues.append("Naprawiono akcenty/apostrofy")
 
-    # 3. SMART CLEANING FOR CITIES
-    # Remove province abbreviations in brackets e.g., "(RM)"
     clean_city = re.sub(r'\s*\([A-Za-z]{2}\)', '', city)
-    # Remove anything after a slash e.g., "Merano /Sinigo" -> "Merano"
+    clean_city = re.sub(r'\s+[A-Za-z]{2}$', '', clean_city).strip() # Fix na prowincje bez nawiasów np. PV
     clean_city = clean_city.split('/')[0].strip()
 
-    # 4. GEOGRAPHICAL VALIDATION
     if 'cap' in df_cap.columns and 'denominazione_ita' in df_cap.columns:
         matching_rows = df_cap[df_cap['cap'] == zip_code]
-        
         if matching_rows.empty:
-            status = "❌ Needs fixing"
-            issues.append(f"CRITICAL: CAP code {zip_code} does not exist in the Italian database.")
+            status = "❌ Wymaga poprawy"
+            issues.append(f"KRYTYCZNE: CAP {zip_code} nie istnieje.")
         else:
             official_cities = matching_rows['denominazione_ita'].str.lower().tolist()
             matches = difflib.get_close_matches(clean_city.lower(), official_cities, n=1, cutoff=0.75)
-            
             if not matches:
-                status = "❌ Needs fixing"
+                status = "❌ Wymaga poprawy"
                 suggested_city = matching_rows.iloc[0]['denominazione_ita'].title()
-                issues.append(f"ERROR: City from Looker ('{city}') doesn't match ZIP {zip_code}. It should be: {suggested_city}")
-    
+                issues.append(f"BŁĄD: Miasto '{city}' nie pasuje do {zip_code}. Powinno być: {suggested_city}")
     return status, " | ".join(issues)
 
+# --- SCRAPER STATUSÓW BRT ---
+def check_brt_status(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        page_text = soup.get_text().lower()
+        
+        if "consegnata" in page_text: return "✅ Dostarczona (Consegnata)"
+        elif "in consegna" in page_text: return "🚚 W doręczeniu (In consegna)"
+        elif "rifiutata" in page_text or "respinta" in page_text: return "❌ Odrzucona przez klienta"
+        elif "indirizzo errato" in page_text or "manca" in page_text or "errato" in page_text: return "❌ Błąd adresu"
+        elif "lasciato avviso" in page_text or "assente" in page_text: return "⚠️ Nikogo nie było w domu (Awizo)"
+        elif "giacenza" in page_text: return "📦 Utknęła w oddziale (Giacenza)"
+        else: return "⚠️ Wymaga sprawdzenia ręcznego"
+    except:
+        return "❌ Błąd połączenia ze stroną"
 
-# --- USER INTERFACE (TABS) ---
-tab1, tab2 = st.tabs(["📁 Bulk Check (CSV File)", "🔍 Check Single Address (Manual)"])
+# --- ZAKŁADKI ---
+tab1, tab2, tab3 = st.tabs(["📁 Masowe sprawdzanie", "🔍 AI Support", "📡 Radar Opóźnień BRT"])
 
-# --- TAB 1: BULK CSV CHECK ---
+# --- ZAKŁADKA 1: MASOWE SPRAWDZANIE ---
 with tab1:
-    uploaded_file = st.file_uploader("Upload Looker CSV file", type=["csv"], key="csv_upload")
-
+    uploaded_file = st.file_uploader("Wgraj plik CSV z adresami", type=["csv"], key="csv_upload")
     if uploaded_file:
         df = pd.read_csv(uploaded_file, dtype={'Postcode': str})
-        
-        if st.button("🚀 Run Instant Validation", type="primary"):
-            results_status = []
-            results_fixes = []
-            
+        if st.button("🚀 Uruchom Walidację", type="primary"):
+            results_status, results_fixes = [], []
             for index, row in df.iterrows():
-                street = row.get('Address 1', row.get('Address', ''))
-                city = row.get('City', row.get('Delivery Area', ''))
-                zip_code = row.get('Postcode', '')
-                
-                # Pass data through our validation engine
-                status, fixes = validate_address(street, city, zip_code, df_cap)
-                
+                status, fixes = validate_address(row.get('Address 1', row.get('Address', '')), row.get('City', row.get('Delivery Area', '')), row.get('Postcode', ''), df_cap)
                 results_status.append(status)
                 results_fixes.append(fixes)
-                
-            df['System Validation'] = results_status
-            df['Recommendations / Report'] = results_fixes
-            
-            st.success("✅ Analysis complete! Data processed in a fraction of a second.")
-            
-            # Show rows with errors first
-            df_errors = df[df['System Validation'] != "✅ OK"]
-            st.dataframe(df_errors if not df_errors.empty else df)
-            
-            st.download_button(
-                label="📥 Download the ready, clean CSV",
-                data=df.to_csv(index=False).encode('utf-8'),
-                file_name='Ready_for_BRT.csv',
-                mime='text/csv',
-            )
+            df['Status Systemowy'] = results_status
+            df['Raport'] = results_fixes
+            st.success("✅ Dane gotowe!")
+            st.dataframe(df[df['Status Systemowy'] != "✅ OK"] if not df[df['Status Systemowy'] != "✅ OK"].empty else df)
+            st.download_button("📥 Pobierz plik", df.to_csv(index=False).encode('utf-8'), 'Gotowe_BRT.csv', 'text/csv')
 
-# --- TAB 2: MANUAL ADDRESS CHECK ---
+# --- ZAKŁADKA 2: SUPPORT / AI ---
 with tab2:
-    st.markdown("### Enter customer data to test")
-    st.markdown("Tool for Customer Support. Instantly check if an address is correct or what fixes nShift will require.")
-    
+    st.markdown("### 🕵️‍♂️ Narzędzie dla Customer Supportu")
     col1, col2, col3 = st.columns(3)
-    with col1:
-        man_street = st.text_input("Street (Address 1)", placeholder="e.g. Via Milano 23")
-    with col2:
-        man_city = st.text_input("City", placeholder="e.g. Merano /Sinigo")
-    with col3:
-        man_zip = st.text_input("ZIP Code (Postcode)", placeholder="e.g. 39012")
+    with col1: man_street = st.text_input("Ulica")
+    with col2: man_city = st.text_input("Miasto")
+    with col3: man_zip = st.text_input("Kod pocztowy")
         
-    if st.button("🔍 Check this address"):
+    if st.button("🔍 Waliduj dla nShift"):
         if man_city and man_zip:
             status, fixes = validate_address(man_street, man_city, man_zip, df_cap)
-            
             st.markdown("---")
-            st.markdown("### Validation Result:")
             if status == "✅ OK":
                 st.success(f"**Status:** {status}")
-                if fixes:
-                    st.info(f"**Note:** The address will pass. The system would automatically apply these fixes in the background: *{fixes}*")
-                else:
-                    st.info("The address is perfect. No fixes required.")
+                if fixes: st.info(f"**Autokorekta:** {fixes}")
             else:
-                st.error(f"**Status:** {status}")
-                st.warning(f"**Error Report:** {fixes}")
+                st.error("ODRZUCONY przez nShift")
+                st.warning(f"**Błąd:** {fixes}")
+                
+                if api_key:
+                    if st.button("🛠️ AI: Napraw Adres"):
+                        with st.spinner("AI analizuje..."):
+                            response = model.generate_content(f'Zrekonstruuj błędny adres dla kuriera nShift. Oddziel Ulicę, Miasto i Kod. Adres: "{man_street} {man_city} {man_zip}". Zwróć tylko czysty JSON: {{"Ulica": "", "Miasto": "", "Kod": ""}}')
+                            st.code(response.text.replace('```json', '').replace('```', '').strip(), language='json')
         else:
-            st.error("⚠️ You must enter at least the City and ZIP code to perform a validation.")
+            st.error("⚠️ Podaj miasto i kod.")
+
+# --- ZAKŁADKA 3: RADAR OPÓŹNIEŃ BRT ---
+with tab3:
+    st.markdown("### 📡 Radar Opóźnień (Skaner Trackingu)")
+    st.markdown("Wgraj raport `Details.csv`, a system sam sprawdzi włoskie statusy na stronie BRT i wyciągnie paczki wymagające interwencji (Ad-hoc box).")
+    
+    details_file = st.file_uploader("Wgraj plik 'Details.csv'", type=["csv"], key="details_upload")
+    
+    if details_file:
+        # Próba wczytania pliku (często raporty mają przesunięty nagłówek)
+        df_details = pd.read_csv(details_file)
+        if 'Tracking URL' not in df_details.columns:
+            details_file.seek(0)
+            df_details = pd.read_csv(details_file, header=1) # Jeżeli Looker dodaje puste wiersze u góry
+            
+        if 'Tracking URL' in df_details.columns and 'Soc Link' in df_details.columns:
+            # Odrzucamy te z jawnym statusem delivered w nShift
+            if 'Consignment Status' in df_details.columns:
+                df_pending = df_details[df_details['Consignment Status'] != 'delivered'].copy()
+            else:
+                df_pending = df_details.copy()
+                
+            # Filtrujemy tylko te, które mają fizycznie wygenerowany link
+            df_pending = df_pending.dropna(subset=['Tracking URL'])
+            
+            st.info(f"🔎 Znaleziono {len(df_pending)} paczek wymagających weryfikacji. Rozpoczynam skanowanie BRT...")
+            
+            if st.button("🚀 Uruchom skanowanie linków BRT", type="primary"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                real_statuses = []
+                total = len(df_pending)
+                
+                for i, row in enumerate(df_pending.iterrows()):
+                    url = str(row[1]['Tracking URL'])
+                    if "http" in url:
+                        # Pobieramy prawdziwy status ze strony BRT
+                        brt_status = check_brt_status(url)
+                    else:
+                        brt_status = "Brak prawidłowego linku"
+                        
+                    real_statuses.append(brt_status)
+                    
+                    # Aktualizacja paska postępu
+                    progress_bar.progress((i + 1) / total)
+                    status_text.text(f"Skanowanie: {i + 1} z {total} paczek...")
+                    time.sleep(0.5) # Krótka pauza, by BRT nie zablokowało bota
+                
+                df_pending['Prawdziwy Status BRT'] = real_statuses
+                
+                # Zostawiamy tylko problemy (odrzucamy te, które na stronie okazały się już dostarczone)
+                df_critical = df_pending[~df_pending['Prawdziwy Status BRT'].str.contains("Dostarczona", na=False)]
+                
+                st.success("✅ Skanowanie zakończone!")
+                st.markdown("### 🚨 Akcje Krytyczne (Zamówienia wymagające interwencji):")
+                
+                # Przygotowujemy ładną tabelę dla Supportu
+                df_display = df_critical[['Prawdziwy Status BRT', 'Tracking URL', 'Soc Link']]
+                
+                # Używamy st.data_editor z formatowaniem linków, żeby można było w nie klikać
+                st.data_editor(
+                    df_display,
+                    column_config={
+                        "Tracking URL": st.column_config.LinkColumn("Link BRT"),
+                        "Soc Link": st.column_config.LinkColumn("Profil Klienta (CRM)")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.download_button(
+                    label="📥 Pobierz listę problemów",
+                    data=df_critical.to_csv(index=False).encode('utf-8'),
+                    file_name='Raport_Krytyczny_BRT.csv',
+                    mime='text/csv'
+                )
+        else:
+            st.error("Błąd: Plik nie zawiera wymaganych kolumn ('Tracking URL', 'Soc Link'). Upewnij się, że wgrywasz poprawny raport Details.csv.")
