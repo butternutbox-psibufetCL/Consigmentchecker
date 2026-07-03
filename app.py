@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import difflib
 import google.generativeai as genai
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import time
 
@@ -80,23 +80,38 @@ def validate_address(street, city, zip_code, df_cap):
                 issues.append(f"ERROR: City '{city}' doesn't match {zip_code}. Should be: {suggested_city}")
     return status, " | ".join(issues)
 
-# --- BRT STATUS SCRAPER ---
+# --- EXACT BRT STATUS EXTRACTOR (ANTI-BOT BYPASS) ---
 def check_brt_status(url):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        page_text = soup.get_text().lower()
+        # cloudscraper idealnie udaje Chrome i omija blokady Cloudflare/Akamai
+        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+        response = scraper.get(url, timeout=15)
         
-        if "consegnata" in page_text: return "✅ Delivered (Consegnata)"
-        elif "in consegna" in page_text: return "🚚 Out for delivery (In consegna)"
-        elif "rifiutata" in page_text or "respinta" in page_text: return "❌ Rejected by customer"
-        elif "indirizzo errato" in page_text or "manca" in page_text or "errato" in page_text: return "❌ Bad address"
-        elif "lasciato avviso" in page_text or "assente" in page_text: return "⚠️ Customer not home (Awizo)"
-        elif "giacenza" in page_text: return "📦 Stuck at depot (Giacenza)"
-        else: return "⚠️ Manual check required"
-    except:
-        return "❌ Connection error"
+        if response.status_code != 200:
+            return f"❌ HTTP Error {response.status_code}"
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Wyciągamy cały tekst ze strony, oddzielając elementy pionową kreską
+        page_text = soup.get_text(separator=' | ', strip=True)
+        
+        # Szukamy włoskich statusów używając wyrażeń regularnych
+        # Szuka wzorca: Data (DD/MM/YYYY) + cokolwiek + Status BRT
+        matches = re.findall(r'(\d{2}/\d{2}/\d{4}.*?(?:Consegnata|Avviso|Rifiutata|Giacenza|consegna|Errato|Manca|Lasciato|Spedizione).*?)(?:\||$)', page_text, re.IGNORECASE)
+        
+        if matches:
+            # Zwracamy pierwszy, najbardziej aktualny status od góry
+            clean_status = re.sub(r'\s+', ' ', matches[0]).strip()
+            return clean_status
+            
+        page_text_lower = page_text.lower()
+        if "captcha" in page_text_lower or "are you human" in page_text_lower or "access denied" in page_text_lower:
+            return "🛡️ BRT Firewall blocked the connection"
+            
+        return "⚠️ Exact tracking not found on page"
+        
+    except Exception as e:
+        return "❌ Connection timeout / Error"
 
 # --- SMART COLUMN DETECTOR (ROBUST VERSION) ---
 def load_robust_csv(uploaded_file, required_columns):
