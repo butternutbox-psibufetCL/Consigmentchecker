@@ -3,14 +3,14 @@ import pandas as pd
 import re
 import difflib
 import google.generativeai as genai
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 import time
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Butternut Box | BRT System", page_icon="🚚", layout="wide")
 st.title("🚚 Hybrid BRT Logistics System")
-st.markdown("ISTAT Validation + AI + Automated Delay Radar (Looker Export Proof).")
+st.markdown("ISTAT Validation + AI + Automated Delay Radar (Safe Mode).")
 
 # --- AI CONFIGURATION (SIDEBAR) ---
 st.sidebar.header("⚙️ AI Settings")
@@ -80,35 +80,38 @@ def validate_address(street, city, zip_code, df_cap):
                 issues.append(f"ERROR: City '{city}' doesn't match {zip_code}. Should be: {suggested_city}")
     return status, " | ".join(issues)
 
-# --- EXACT BRT STATUS EXTRACTOR (ANTI-BOT BYPASS) ---
+# --- SAFE BRT STATUS EXTRACTOR ---
 def check_brt_status(url):
     try:
-        # cloudscraper idealnie udaje Chrome i omija blokady Cloudflare/Akamai
-        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
-        response = scraper.get(url, timeout=15)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
         
-        if response.status_code != 200:
-            return f"❌ HTTP Error {response.status_code}"
+        if response.status_code in [403, 429, 503]:
+            return "🛡️ BRT Firewall blocked Cloud IP"
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Wyciągamy cały tekst ze strony, oddzielając elementy pionową kreską
-        page_text = soup.get_text(separator=' | ', strip=True)
-        
-        # Szukamy włoskich statusów używając wyrażeń regularnych
-        # Szuka wzorca: Data (DD/MM/YYYY) + cokolwiek + Status BRT
-        matches = re.findall(r'(\d{2}/\d{2}/\d{4}.*?(?:Consegnata|Avviso|Rifiutata|Giacenza|consegna|Errato|Manca|Lasciato|Spedizione).*?)(?:\||$)', page_text, re.IGNORECASE)
-        
-        if matches:
-            # Zwracamy pierwszy, najbardziej aktualny status od góry
-            clean_status = re.sub(r'\s+', ' ', matches[0]).strip()
-            return clean_status
+        # Próbuje wyciągnąć tabelę, jeśli BRT łaskawie nas wpuści
+        history_rows = []
+        for tr in soup.find_all('tr'):
+            row_text = tr.get_text(separator=' | ', strip=True)
+            if re.search(r'\d{2}/\d{2}/\d{4}', row_text):
+                clean_row = re.sub(r'\s+', ' ', row_text)
+                history_rows.append(clean_row)
+                
+        if history_rows:
+            return history_rows[0]
+
+        # Wychwytywanie Captchy z Cloudflare
+        page_text = soup.get_text().lower()
+        if "captcha" in page_text or "are you human" in page_text:
+            return "🛡️ BRT Firewall blocked the connection (Captcha)"
             
-        page_text_lower = page_text.lower()
-        if "captcha" in page_text_lower or "are you human" in page_text_lower or "access denied" in page_text_lower:
-            return "🛡️ BRT Firewall blocked the connection"
-            
-        return "⚠️ Exact tracking not found on page"
+        return "⚠️ Please check manually (Blocked)"
         
     except Exception as e:
         return "❌ Connection timeout / Error"
@@ -184,8 +187,8 @@ with tab2:
 
 # --- TAB 3: BRT DELAY RADAR ---
 with tab3:
-    st.markdown("### 📡 Delay Radar (Format-proof)")
-    st.markdown("Upload Looker/BRT CSV report. The system will find the correct columns regardless of the file format.")
+    st.markdown("### 📡 Delay Radar (Safe Mode / Exact Extractor)")
+    st.markdown("Upload Looker/BRT CSV report. Extracts statuses when possible, handles IP blocks gracefully.")
     
     details_file = st.file_uploader("Upload Looker/BRT CSV report", type=["csv"], key="details_upload")
     
@@ -224,13 +227,14 @@ with tab3:
                     status_text.text(f"Scanning: {i + 1} / {total}")
                     time.sleep(0.5) 
                 
-                df_pending['Real BRT Status'] = real_statuses
-                df_critical = df_pending[~df_pending['Real BRT Status'].str.contains("Delivered", na=False)]
+                df_pending['Exact BRT Scan'] = real_statuses
+                
+                df_critical = df_pending[~df_pending['Exact BRT Scan'].str.lower().str.contains("consegnata", na=False)]
                 
                 st.success("✅ Scan complete!")
-                st.markdown("### 🚨 Required Actions (Delays & Issues):")
+                st.markdown("### 🚨 Required Actions (Exact BRT Output):")
                 
-                df_display = df_critical[['Real BRT Status', url_col, soc_col]]
+                df_display = df_critical[['Exact BRT Scan', url_col, soc_col]]
                 st.data_editor(
                     df_display,
                     column_config={
