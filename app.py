@@ -10,7 +10,7 @@ import time
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Butternut Box | BRT System", page_icon="🚚", layout="wide")
 st.title("🚚 Hybrydowy System Logistyczny BRT")
-st.markdown("Walidacja ISTAT + AI + Automatyczny Radar Opóźnień (Odporny na format plików z Lookera).")
+st.markdown("Walidacja ISTAT + AI + Automatyczny Radar Opóźnień (Teraz z oryginalnymi komunikatami BRT!).")
 
 # --- KONFIGURACJA AI (PASEK BOCZNY) ---
 st.sidebar.header("⚙️ Ustawienia AI")
@@ -80,7 +80,7 @@ def validate_address(street, city, zip_code, df_cap):
                 issues.append(f"BŁĄD: Miasto '{city}' nie pasuje do {zip_code}. Powinno być: {suggested_city}")
     return status, " | ".join(issues)
 
-# --- SCRAPER STATUSÓW BRT ---
+# --- SCRAPER STATUSÓW BRT (NOWA WERSJA) ---
 def check_brt_status(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -88,22 +88,49 @@ def check_brt_status(url):
         soup = BeautifulSoup(response.text, 'html.parser')
         page_text = soup.get_text().lower()
         
-        if "consegnata" in page_text: return "✅ Dostarczona (Consegnata)"
-        elif "in consegna" in page_text: return "🚚 W doręczeniu (In consegna)"
-        elif "rifiutata" in page_text or "respinta" in page_text: return "❌ Odrzucona przez klienta"
-        elif "indirizzo errato" in page_text or "manca" in page_text or "errato" in page_text: return "❌ Błąd adresu"
-        elif "lasciato avviso" in page_text or "assente" in page_text: return "⚠️ Nikogo nie było w domu (Awizo)"
-        elif "giacenza" in page_text: return "📦 Utknęła w oddziale (Giacenza)"
-        else: return "⚠️ Wymaga sprawdzenia ręcznego"
+        # 1. Kategoryzacja na podstawie słów kluczowych
+        basic_status = "⚠️ W drodze / Inny"
+        if "consegnata" in page_text: basic_status = "✅ Dostarczona"
+        elif "in consegna" in page_text: basic_status = "🚚 W doręczeniu"
+        elif "rifiutata" in page_text or "respinta" in page_text: basic_status = "❌ Odrzucona"
+        elif "indirizzo errato" in page_text or "manca" in page_text or "errato" in page_text: basic_status = "❌ Błąd adresu"
+        elif "lasciato avviso" in page_text or "assente" in page_text: basic_status = "⚠️ Awizo (Nieobecność)"
+        elif "giacenza" in page_text: basic_status = "📦 Utknęła w oddziale (Giacenza)"
+
+        # 2. Inteligentne wyciąganie tekstu z kolumny "Stato della spedizione"
+        exact_status = "Brak szczegółów na stronie"
+        tables = soup.find_all('table')
+        
+        for table in tables:
+            rows = table.find_all('tr')
+            if not rows: continue
+            
+            # Szukamy kolumny ze statusem w nagłówku tabeli
+            col_index = -1
+            header_cells = rows[0].find_all(['th', 'td'])
+            
+            for i, cell in enumerate(header_cells):
+                cell_text = cell.get_text(strip=True).lower()
+                if "stato della spedizione" in cell_text or "esito" in cell_text:
+                    col_index = i
+                    break
+            
+            # Jeśli znaleźliśmy nagłówek, pobieramy komórkę z pierwszego wiersza z danymi poniżej
+            if col_index != -1 and len(rows) > 1:
+                data_cells = rows[1].find_all(['td', 'th'])
+                if col_index < len(data_cells):
+                    exact_status = data_cells[col_index].get_text(separator=" ", strip=True)
+                break
+
+        return basic_status, exact_status
     except:
-        return "❌ Błąd połączenia ze stroną"
+        return "❌ Błąd połączenia", "Nie udało się pobrać strony"
 
 # --- SMART DETEKTOR KOLUMN ---
 def load_robust_csv(uploaded_file, required_columns):
     uploaded_file.seek(0)
-    df_temp = pd.read_csv(uploaded_file, header=None) # Wczytujemy wszystko jak leci
+    df_temp = pd.read_csv(uploaded_file, header=None) 
     
-    # Przeszukujemy pierwsze 20 wierszy w poszukiwaniu naszych kolumn
     header_idx = None
     for idx, row in df_temp.head(20).iterrows():
         row_str = " ".join([str(val) for val in row.values])
@@ -113,7 +140,6 @@ def load_robust_csv(uploaded_file, required_columns):
             
     if header_idx is not None:
         uploaded_file.seek(0)
-        # Ładujemy plik, ucinając wszystkie śmieci powyżej znalezionego nagłówka
         return pd.read_csv(uploaded_file, header=header_idx)
     return None
 
@@ -167,66 +193,69 @@ with tab2:
 # --- ZAKŁADKA 3: RADAR OPÓŹNIEŃ BRT ---
 with tab3:
     st.markdown("### 📡 Radar Opóźnień (Odporny na formatowanie)")
-    st.markdown("Wgraj raport CSV. System sam znajdzie odpowiednie kolumny, niezależnie od śmieci w pliku.")
+    st.markdown("Wgraj raport CSV. System sam znajdzie paczki niedoręczone, połączy się z BRT i pobierze **dokładny tekst komunikatu kuriera**.")
     
     details_file = st.file_uploader("Wgraj plik raportu BRT/Looker", type=["csv"], key="details_upload")
     
     if details_file:
-        # Używamy naszego nowego, inteligentnego detektora!
         df_details = load_robust_csv(details_file, ['Tracking URL', 'Soc Link'])
             
         if df_details is not None:
-            # Szukamy kolumny ze statusem (żeby ominąć już dostarczone)
             status_col = [col for col in df_details.columns if 'status' in col.lower()]
             if status_col:
                 df_pending = df_details[df_details[status_col[0]].astype(str).str.lower() != 'delivered'].copy()
             else:
                 df_pending = df_details.copy()
                 
-            # Filtrujemy tylko te, które faktycznie mają link BRT
             df_pending = df_pending.dropna(subset=['Tracking URL'])
             df_pending = df_pending[df_pending['Tracking URL'].astype(str).str.contains('http')]
             
-            st.info(f"🔎 Oczyszczono plik! Znaleziono nagłówki i wyizolowano {len(df_pending)} paczek wymagających sprawdzenia.")
+            st.info(f"🔎 Oczyszczono plik! Wyizolowano {len(df_pending)} paczek wymagających sprawdzenia na serwerach BRT.")
             
             if st.button("🚀 Skanuj statusy BRT", type="primary"):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
                 real_statuses = []
+                exact_statuses = []
                 total = len(df_pending)
                 
                 for i, row in enumerate(df_pending.iterrows()):
                     url = str(row[1]['Tracking URL'])
-                    brt_status = check_brt_status(url)
-                    real_statuses.append(brt_status)
+                    basic, exact = check_brt_status(url)
+                    
+                    real_statuses.append(basic)
+                    exact_statuses.append(exact)
                     
                     progress_bar.progress((i + 1) / total)
-                    status_text.text(f"Sprawdzam: {i + 1} / {total}")
+                    status_text.text(f"Sprawdzam na serwerach BRT: {i + 1} / {total}")
                     time.sleep(0.5) 
                 
-                df_pending['Prawdziwy Status BRT'] = real_statuses
-                df_critical = df_pending[~df_pending['Prawdziwy Status BRT'].str.contains("Dostarczona", na=False)]
+                df_pending['Kategoria Statusu'] = real_statuses
+                df_pending['Ostatni Status z BRT'] = exact_statuses
+                
+                df_critical = df_pending[~df_pending['Kategoria Statusu'].str.contains("Dostarczona", na=False)]
                 
                 st.success("✅ Skanowanie zakończone!")
-                st.markdown("### 🚨 Wymagane Akcje (Opóźnienia i Zwroty):")
+                st.markdown("### 🚨 Wymagane Akcje (Szczegóły z portalu BRT):")
                 
-                df_display = df_critical[['Prawdziwy Status BRT', 'Tracking URL', 'Soc Link']]
+                df_display = df_critical[['Kategoria Statusu', 'Ostatni Status z BRT', 'Tracking URL', 'Soc Link']]
                 st.data_editor(
                     df_display,
                     column_config={
                         "Tracking URL": st.column_config.LinkColumn("Link BRT"),
-                        "Soc Link": st.column_config.LinkColumn("Profil CRM")
+                        "Soc Link": st.column_config.LinkColumn("Profil CRM"),
+                        "Ostatni Status z BRT": st.column_config.TextColumn("Dokładny Komunikat Kuriera")
                     },
                     hide_index=True,
                     use_container_width=True
                 )
                 
                 st.download_button(
-                    label="📥 Pobierz listę problemów",
+                    label="📥 Pobierz pełny raport problemów",
                     data=df_critical.to_csv(index=False).encode('utf-8'),
-                    file_name='Raport_Krytyczny_BRT.csv',
+                    file_name='Raport_Krytyczny_BRT_Szczegolowy.csv',
                     mime='text/csv'
                 )
         else:
-            st.error("❌ Błąd: Nie znalazłem w tym pliku kolumn 'Tracking URL' ani 'Soc Link'. Upewnij się, że pobierasz odpowiedni raport z Lookera.")
+            st.error("❌ Błąd: Nie znalazłem w tym pliku kolumn 'Tracking URL' ani 'Soc Link'.")
